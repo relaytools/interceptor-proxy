@@ -378,8 +378,11 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 			// Here we *could* do additional REQ filtering for the sensitive types, however, do we really want to attempt parsing
 			// EVERY kind of REQ looking for these?  That seems problematic.. 
-
 			// actually, we need to do this on the backend part instead (see below) (EVENT)
+
+			// ALTHOUGH this could be useful for denying SIMPLE request types (such as possibly negentropy requests)
+			// TODO: further audit strfry, see if PRIVATE event types are bypassed for negentropy syncs, or if they are sent via regular nostr EVENTS that's ok
+
 			/*
 			var r []string
 			json.Unmarshal([]byte(msg), &r)
