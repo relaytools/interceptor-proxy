@@ -406,7 +406,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			*/
 
 			// we could filter the returned events, and drop any that are the sensitive types
-			// TODO: we only want to run this filter, on one side of the interceptor connection..
+			// DONE: we only want to run this filter, on one side of the interceptor connection..
 			if filter == true {
 				var r []interface{}
 
