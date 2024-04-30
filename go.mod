@@ -1,4 +1,4 @@
-module github.com/koding/websocketproxy
+module github.com/relaytools/interceptor-proxy
 
 go 1.22.0
 
