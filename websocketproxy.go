@@ -61,11 +61,17 @@ type WebsocketProxy struct {
 	//Config URL
 	ConfigURL *string
 
+	//Mode
+	Mode *string
 }
 
 type NostrReq struct {
 	Kinds []int `json:"kinds"`
 	Authors []string `json:"authors"`
+}
+
+type NostrEvent struct {
+
 }
 
 type HostResponse struct {
@@ -150,7 +156,8 @@ func quickQuery(hostname string, pubkey string, cURL string) (bool) {
 
 // NewProxy returns a new Websocket reverse proxy that rewrites the
 // URL's to the scheme, host and base path provider in target.
-func NewProxy(cURL string) *WebsocketProxy {
+// mode can be private_relay or protected_dms
+func NewProxy(cURL string, mode string) *WebsocketProxy {
 
 	backend := func(r *http.Request) *url.URL {
 		// u is in the format ws://IP:PORT
@@ -172,7 +179,7 @@ func NewProxy(cURL string) *WebsocketProxy {
 		return u
 	}
 	
-	return &WebsocketProxy{Backend: backend, ConfigURL: &cURL}
+	return &WebsocketProxy{Backend: backend, ConfigURL: &cURL, Mode: &mode}
 }
 
 // ServeHTTP implements the http.Handler that proxies WebSocket connections.
@@ -223,6 +230,12 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			clientIP = strings.Join(prior, ", ") + ", " + clientIP
 		}
 		requestHeader.Set("X-Forwarded-For", clientIP)
+	}
+
+	// pass through x-real-ip
+	realip := req.Header.Get("X-Real-IP");
+	if realip != "" {
+		requestHeader.Set("X-Real-IP", realip)
 	}
 
 	// Set the originating protocol of the incoming HTTP request. The SSL might
@@ -312,12 +325,17 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 		var ev event.T
 
+		// avoid panic
+		if len(result) == 0 {
+			continue
+		}
+
 		if result[0] == "REQ" {
 			if err := connPub.WriteMessage(websocket.TextMessage, authRequest); err != nil {
 				log.Printf("websocketproxy: couldn't send initial message: %s", err)
 				return
 			}
-			log.Printf("websocketproxy: received REQ message: closing and responding with AUTH")
+			log.Printf("websocketproxy: received REQ message %s from %s: closing and responding with AUTH", result, realip)
 			closeString := fmt.Sprintf(`["CLOSED","%v","auth-required: you must auth"]`, result[1])
 			closeReq := []byte(closeString)
 			if err := connPub.WriteMessage(websocket.TextMessage, closeReq); err != nil {
@@ -331,24 +349,59 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				return
 			}
 		}
+
+		if result[0] == "EVENT" {
+			// need to get the eventID
+			modifiedMessage := authmessage[9 : len(authmessage)-2]
+
+			err := json.Unmarshal(modifiedMessage, &ev)
+			if err != nil {
+				log.Printf("websocketproxy: couldn't parse event: %s", err)
+				return
+			}
+
+			// send auth, and OK false in response
+			if err := connPub.WriteMessage(websocket.TextMessage, authRequest); err != nil {
+				log.Printf("websocketproxy: couldn't send initial message: %s", err)
+				return
+			}
+			log.Printf("websocketproxy: received EVENT message %s from %s: responding OK false auth required", result, realip)
+			falseString := fmt.Sprintf(`["OK","%s","false","auth-required: you must auth"]`, ev.ID)
+			sendFalse := []byte(falseString)
+			if err := connPub.WriteMessage(websocket.TextMessage, sendFalse); err != nil {
+				log.Printf("websocketproxy: couldn't send OK=false message: %s", err)
+				return
+			}
+		}
+
 		// Accept any attempt by client to AUTH and allow them through
 		if result[0] == "AUTH" {
-			log.Printf("websocketproxy: received AUTH message: %s", authmessage)
+			//log.Printf("websocketproxy: received AUTH message: %s", authmessage)
 			modifiedMessage := authmessage[8 : len(authmessage)-1]
 
 			// parse the event
-			fmt.Println(string(modifiedMessage))
+			//fmt.Println(string(modifiedMessage))
 			json.Unmarshal(modifiedMessage, &ev)
 
 			fmt.Println("wss://" + req.Host)
 			gotPubkey, gotOk, gotErr := auth.Validate(&ev, challengeString, "wss://" + req.Host)
 
 			if gotErr != nil {
-				log.Printf("websocketproxy: failed to validate AUTH event: %s %s", result[1], gotErr)
+				log.Printf("websocketproxy: failed to validate AUTH event: %s; %s; challengeWas: %s, challengeRecv: %v", gotErr, modifiedMessage, challengeString, ev.Tags)
 				return
 			}
 
-			if gotOk && quickQuery(req.Host, gotPubkey, *w.ConfigURL) {
+			if gotOk && *w.Mode == "private_relay" && quickQuery(req.Host, gotPubkey, *w.ConfigURL) {
+				okString := fmt.Sprintf(`["OK","%v",true,""]`, ev.ID)
+				okResp := []byte(okString)
+				log.Printf("websocketproxy: AUTH success for pubkey %s; %s; %v", gotPubkey, modifiedMessage, ev.Tags)
+				if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
+					log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
+					return
+				}
+				w.LoggedInAs = &gotPubkey
+				authComplete = true
+			} else if gotOk && *w.Mode == "protected_dms" {
 				okString := fmt.Sprintf(`["OK","%v",true,""]`, ev.ID)
 				okResp := []byte(okString)
 				log.Printf("websocketproxy: AUTH success for pubkey %s", gotPubkey)
@@ -367,6 +420,13 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					return
 				}
 			}
+		} else {
+			// in this mode, we don't care if they finished the auth
+			/*
+			if *w.Mode == "protected_dms" {
+				authComplete = true
+			}
+			*/
 		}
 	}
 
@@ -383,10 +443,16 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			// ALTHOUGH this could be useful for denying SIMPLE request types (such as possibly negentropy requests)
 			// TODO: further audit strfry, see if PRIVATE event types are bypassed for negentropy syncs, or if they are sent via regular nostr EVENTS that's ok
 
+			// If the connection is already authenticated, drop any subsequent AUTH requests (or strfry will respond with error)
+
 			/*
+			if filter == false {
 			var r []string
 			json.Unmarshal([]byte(msg), &r)
-			if r[0] == "REQ" {
+			if r[0] == "AUTH" {
+				log.Printf("Connection already authenticated: DROPPING duplicate AUTH REQUEST: %s", r[1])
+				break
+				/*
 				// decode the json payload of the REQ
 				var nostrReq NostrReq
 				modifiedMessage := r[2]
@@ -401,9 +467,10 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					}
 
 				}
-
 			}
-			*/
+		}
+				*/
+		
 
 			// we could filter the returned events, and drop any that are the sensitive types
 			// DONE: we only want to run this filter, on one side of the interceptor connection..
@@ -422,6 +489,10 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					evPubkey := evJson["pubkey"].(string)
 					if evKind == 4 || evKind == 1059 || evKind == 1060 {
 						isSensitive = true
+						// If not logged in, drop the message
+						if *w.LoggedInAs == "" {
+							break
+						}
 						//log.Printf("FOUND PRIVATE EVENT: kind:%0.f, auth:%s, author:%s", evKind, *w.LoggedInAs, evPubkey)
 						if evPubkey == *w.LoggedInAs {
 							log.Printf("ALLOWING PRIVATE EVENT for author %s, kind %.0f", *w.LoggedInAs, evKind)
