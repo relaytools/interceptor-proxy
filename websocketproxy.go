@@ -14,8 +14,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"mleku.dev/git/nostr/auth"
-	"mleku.dev/git/nostr/event"
+	"github.com/nbd-wtf/go-nostr"
+	"github.com/nbd-wtf/go-nostr/nip42"
 )
 
 var (
@@ -60,9 +60,6 @@ type WebsocketProxy struct {
 
 	//Config URL
 	ConfigURL *string
-
-	//Mode
-	Mode *string
 }
 
 type NostrReq struct {
@@ -157,7 +154,7 @@ func quickQuery(hostname string, pubkey string, cURL string) (bool) {
 // NewProxy returns a new Websocket reverse proxy that rewrites the
 // URL's to the scheme, host and base path provider in target.
 // mode can be private_relay or protected_dms
-func NewProxy(cURL string, mode string) *WebsocketProxy {
+func NewProxy(cURL string) *WebsocketProxy {
 
 	backend := func(r *http.Request) *url.URL {
 		// u is in the format ws://IP:PORT
@@ -179,7 +176,7 @@ func NewProxy(cURL string, mode string) *WebsocketProxy {
 		return u
 	}
 	
-	return &WebsocketProxy{Backend: backend, ConfigURL: &cURL, Mode: &mode}
+	return &WebsocketProxy{Backend: backend, ConfigURL: &cURL}
 }
 
 // ServeHTTP implements the http.Handler that proxies WebSocket connections.
@@ -312,6 +309,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Perform NIP-42 authentication
 	authComplete := false
 	var authmessage []byte
+	var ev nostr.Event
 	for !authComplete {
 		// Wait for the response
 		_, authmessage, err = connPub.ReadMessage()
@@ -323,12 +321,11 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		var result []string
 		json.Unmarshal([]byte(authmessage), &result)
 
-		var ev event.T
-
 		// avoid panic
 		if len(result) == 0 {
 			continue
 		}
+
 
 		if result[0] == "REQ" {
 			if err := connPub.WriteMessage(websocket.TextMessage, authRequest); err != nil {
@@ -342,21 +339,23 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
 				return
 			}
+			/* don't send EOSE, this is not in the spec (anymore?)
 			eoseString := fmt.Sprintf(`["EOSE","%v"]`, result[1])
 			eoseReq := []byte(eoseString)
 			if err := connPub.WriteMessage(websocket.TextMessage, eoseReq); err != nil {
 				log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
 				return
 			}
+			*/
 		}
 
 		if result[0] == "EVENT" {
 			// need to get the eventID
-			modifiedMessage := authmessage[9 : len(authmessage)-2]
+			modifiedMessage := authmessage[9 : len(authmessage)-1]
 
 			err := json.Unmarshal(modifiedMessage, &ev)
 			if err != nil {
-				log.Printf("websocketproxy: couldn't parse event: %s", err)
+				log.Printf("websocketproxy: couldn't parse event: %s\n, %s\n, %s\n", string(authmessage), string(modifiedMessage), err)
 				return
 			}
 
@@ -384,27 +383,12 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			json.Unmarshal(modifiedMessage, &ev)
 
 			fmt.Println("wss://" + req.Host)
-			gotPubkey, gotOk, gotErr := auth.Validate(&ev, challengeString, "wss://" + req.Host)
+			gotPubkey, gotOk := nip42.ValidateAuthEvent(&ev, challengeString, "wss://" + req.Host)
 
-			if gotErr != nil {
-				log.Printf("websocketproxy: failed to validate AUTH event: %s; %s; challengeWas: %s, challengeRecv: %v", gotErr, modifiedMessage, challengeString, ev.Tags)
-				return
-			}
-
-			if gotOk && *w.Mode == "private_relay" && quickQuery(req.Host, gotPubkey, *w.ConfigURL) {
+			if gotOk && quickQuery(req.Host, gotPubkey, *w.ConfigURL) {
 				okString := fmt.Sprintf(`["OK","%v",true,""]`, ev.ID)
 				okResp := []byte(okString)
 				log.Printf("websocketproxy: AUTH success for pubkey %s; %s; %v", gotPubkey, modifiedMessage, ev.Tags)
-				if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
-					log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
-					return
-				}
-				w.LoggedInAs = &gotPubkey
-				authComplete = true
-			} else if gotOk && *w.Mode == "protected_dms" {
-				okString := fmt.Sprintf(`["OK","%v",true,""]`, ev.ID)
-				okResp := []byte(okString)
-				log.Printf("websocketproxy: AUTH success for pubkey %s", gotPubkey)
 				if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
 					log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
 					return
@@ -420,14 +404,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					return
 				}
 			}
-		} else {
-			// in this mode, we don't care if they finished the auth
-			/*
-			if *w.Mode == "protected_dms" {
-				authComplete = true
-			}
-			*/
-		}
+		} 
 	}
 
 	errClient := make(chan error, 1)
@@ -435,7 +412,6 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	replicateWebsocketConn := func(filter bool, dst, src *websocket.Conn, errc chan error) {
 		for {
 			msgType, msg, err := src.ReadMessage()
-
 			// Here we *could* do additional REQ filtering for the sensitive types, however, do we really want to attempt parsing
 			// EVERY kind of REQ looking for these?  That seems problematic.. 
 			// actually, we need to do this on the backend part instead (see below) (EVENT)
@@ -443,36 +419,27 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			// ALTHOUGH this could be useful for denying SIMPLE request types (such as possibly negentropy requests)
 			// TODO: further audit strfry, see if PRIVATE event types are bypassed for negentropy syncs, or if they are sent via regular nostr EVENTS that's ok
 
-			// If the connection is already authenticated, drop any subsequent AUTH requests (or strfry will respond with error)
-
-			/*
+			// If the connection is already authenticated, respond with OK and continue (or strfry will respond with error)
 			if filter == false {
-			var r []string
-			json.Unmarshal([]byte(msg), &r)
-			if r[0] == "AUTH" {
-				log.Printf("Connection already authenticated: DROPPING duplicate AUTH REQUEST: %s", r[1])
-				break
-				/*
-				// decode the json payload of the REQ
-				var nostrReq NostrReq
-				modifiedMessage := r[2]
-				fmt.Println(string(modifiedMessage))
-				json.Unmarshal([]byte(modifiedMessage), &nostrReq)	
-
-				for _, i := range nostrReq.Kinds {
-					if i == 4 {
-						// perform pubkey check
-
-
+				var r []string
+				json.Unmarshal([]byte(msg), &r)
+				if len(r) > 0 {
+					if r[0] == "AUTH" {
+						modifiedMessage := msg[8 : len(msg)-1]
+						json.Unmarshal(modifiedMessage, &ev)
+						log.Printf("websocketproxy: Already authenticated, RESENDING OK for %s; %s; %v", ev.PubKey, modifiedMessage, ev.Tags)
+						okString := fmt.Sprintf(`["OK","%v",true,""]`, ev.ID)
+						okResp := []byte(okString)
+						if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
+							log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
+							return
+						}	
+						continue
 					}
-
 				}
 			}
-		}
-				*/
-		
 
-			// we could filter the returned events, and drop any that are the sensitive types
+			// filter the returned events, and drop any that are the sensitive types
 			// DONE: we only want to run this filter, on one side of the interceptor connection..
 			if filter == true {
 				var r []interface{}
