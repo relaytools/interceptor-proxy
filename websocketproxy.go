@@ -365,7 +365,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				return
 			}
 			log.Printf("websocketproxy: received EVENT message %s from %s: responding OK false auth required", result, realip)
-			falseString := fmt.Sprintf(`["OK","%s","false","auth-required: you must auth"]`, ev.ID)
+			falseString := fmt.Sprintf(`["OK","%s",false,"auth-required: you must auth"]`, ev.ID)
 			sendFalse := []byte(falseString)
 			if err := connPub.WriteMessage(websocket.TextMessage, sendFalse); err != nil {
 				log.Printf("websocketproxy: couldn't send OK=false message: %s", err)
