@@ -55,9 +55,6 @@ type WebsocketProxy struct {
 	//  If nil, DefaultDialer is used.
 	Dialer *websocket.Dialer
 
-	//Logged in as (pubkey)
-	LoggedInAs *string
-
 	//Config URL
 	ConfigURL *string
 }
@@ -324,6 +321,8 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	var authmessage []byte
 	var ev nostr.Event
 	authStatus := ""
+	loggedInAs := ""
+
 	for !authComplete {
 		// Wait for the response
 		_, authmessage, err = connPub.ReadMessage()
@@ -409,7 +408,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
 					return
 				}
-				w.LoggedInAs = &gotPubkey
+				loggedInAs = gotPubkey
 				authStatus = authResp.Status
 				authComplete = true
 			} else {
@@ -461,7 +460,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					// this is here to handle the case for private inbox relays where we do not allow REQs for partially authenticated users
 					} else if r[0] == "REQ" {
 						if authStatus == "partial" {
-							log.Printf("partial access detected, dropping req for %s", *w.LoggedInAs)
+							log.Printf("partial access detected, dropping req for %s", loggedInAs)
 							// close the REQ with no results
 							closeString := fmt.Sprintf(`["CLOSED","%v","auth-required: you are not authorized to perform reqs"]`, r[1])
 							closeReq := []byte(closeString)
@@ -501,34 +500,33 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					// if authStatus is partial, the user is only allowed to send Events but not read them.
 					// in theory this does not happen because we are blocking all REQs for partially authenticated users already.
 					if authStatus == "partial" {
-						log.Printf("partial access detected, dropping event for %s", *w.LoggedInAs)
+						log.Printf("partial access detected, dropping event for %s", loggedInAs)
 						continue
 					}
 
 					if evKind == 4 || evKind == 1059 || evKind == 1060 {
 						isSensitive = true
 						//log.Printf("FOUND PRIVATE EVENT: kind:%0.f, auth:%s, author:%s", evKind, *w.LoggedInAs, evPubkey)
-						if evPubkey == *w.LoggedInAs {
-							log.Printf("ALLOWING PRIVATE EVENT for author %s, kind %.0f", *w.LoggedInAs, evKind)
+						if evPubkey == loggedInAs {
+							log.Printf("ALLOWING PRIVATE EVENT for author %s, kind %.0f", loggedInAs, evKind)
 							isAllow = true
 						}
 						tags := evJson["tags"].([]interface{})
 						for _, tag := range tags {
 							tagKey := tag.([]interface{})[0].(string)
 							tagVal := tag.([]interface{})[1].(string)
-							//log.Printf("TAG: %s, %s", tagKey, tagVal)
-							if(tagKey == "p" && tagVal == *w.LoggedInAs) {
-								log.Printf("ALLOWING PRIVATE EVENT for ptag %s, kind %.0f", *w.LoggedInAs, evKind)
+							log.Printf("TAG: %s, %s", tagKey, tagVal)
+							if(tagKey == "p" && tagVal == loggedInAs) {
+								log.Printf("ALLOWING PRIVATE EVENT for ptag %s, kind %.0f", loggedInAs, evKind)
 								isAllow = true
 							}
 						}
 					}
-				}
-
-				// drop this message if it's sensitive and didn't contain the P tag for logged in pubkey
-				if isSensitive && !isAllow {
-					log.Printf("DROPPING PRIVATE EVENT (unauthorized) for %s", *w.LoggedInAs)
-					continue
+					// drop this message if it's sensitive and didn't contain the P tag for logged in pubkey
+					if isSensitive && !isAllow {
+						log.Printf("DROPPING PRIVATE EVENT (unauthorized) for %s", loggedInAs)
+						continue
+					}
 				}
 			}
 	
