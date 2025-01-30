@@ -60,24 +60,23 @@ type WebsocketProxy struct {
 }
 
 type NostrReq struct {
-	Kinds []int `json:"kinds"`
+	Kinds   []int    `json:"kinds"`
 	Authors []string `json:"authors"`
 }
 
 type NostrEvent struct {
-
 }
 
 type HostResponse struct {
-	Name string `json:"name"`
-	IP string `json:"ip"`
-	Port int `json:"port"`
+	Name   string `json:"name"`
+	IP     string `json:"ip"`
+	Port   int    `json:"port"`
 	Domain string `json:"domain"`
 }
 
 type AuthorizedResponse struct {
-	Authorized bool `json:"authorized"`
-	Status string `json:"status"`
+	Authorized bool   `json:"authorized"`
+	Status     string `json:"status"`
 }
 
 func quickHostQuery(hostname string, cURL string) (string, error) {
@@ -102,12 +101,12 @@ func quickHostQuery(hostname string, cURL string) (string, error) {
 	if res.StatusCode == 200 {
 		defer res.Body.Close()
 		var hostResponse HostResponse
-        decodeErr := json.NewDecoder(res.Body).Decode(&hostResponse)
+		decodeErr := json.NewDecoder(res.Body).Decode(&hostResponse)
 
-        if decodeErr != nil {
-            log.Println(decodeErr.Error())
-            return "", decodeErr
-        }
+		if decodeErr != nil {
+			log.Println(decodeErr.Error())
+			return "", decodeErr
+		}
 
 		useIP := "127.0.0.1"
 		if hostResponse.IP != "" {
@@ -116,7 +115,7 @@ func quickHostQuery(hostname string, cURL string) (string, error) {
 
 		uri := fmt.Sprintf("ws://%s:%d", useIP, hostResponse.Port)
 
-        return uri, nil
+		return uri, nil
 	} else {
 		return "", fmt.Errorf("error unmarshaling json")
 	}
@@ -185,7 +184,7 @@ func NewProxy(cURL string) *WebsocketProxy {
 		u.RawQuery = r.URL.RawQuery
 		return u
 	}
-	
+
 	return &WebsocketProxy{Backend: backend, ConfigURL: &cURL}
 }
 
@@ -240,7 +239,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 
 	// pass through x-real-ip
-	realip := req.Header.Get("X-Real-IP");
+	realip := req.Header.Get("X-Real-IP")
 	if realip != "" {
 		requestHeader.Set("X-Real-IP", realip)
 	}
@@ -323,6 +322,8 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	authStatus := ""
 	loggedInAs := ""
 
+	authCount := 0
+
 	for !authComplete {
 		// Wait for the response
 		_, authmessage, err = connPub.ReadMessage()
@@ -331,6 +332,17 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			return
 		}
 
+		// tarpit
+		if authCount > 5 {
+			log.Printf("Client entering tarpit (tries: %d): %s", authCount, realip)
+			time.Sleep(60 * time.Second)
+			// return here or just keep going?
+			//return
+
+			// for now, keep the connection open like a true tarpit, see if we exhaust the connections or not.
+		}
+		authCount += 1
+
 		var result []string
 		json.Unmarshal([]byte(authmessage), &result)
 
@@ -338,7 +350,6 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		if len(result) == 0 {
 			continue
 		}
-
 
 		if result[0] == "REQ" {
 			if err := connPub.WriteMessage(websocket.TextMessage, authRequest); err != nil {
@@ -352,23 +363,23 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
 				return
 			}
-			/* don't send EOSE, this is not in the spec (anymore?)
+			// send EOSE, this is not in the spec (anymore?) seems that scrapers will want it tho, so they can go away.
 			eoseString := fmt.Sprintf(`["EOSE","%v"]`, result[1])
+			log.Printf("debug eose %s", eoseString)
 			eoseReq := []byte(eoseString)
 			if err := connPub.WriteMessage(websocket.TextMessage, eoseReq); err != nil {
 				log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
 				return
 			}
-			*/
 		}
 
 		if result[0] == "EVENT" {
-			// need to get the eventID
-			modifiedMessage := authmessage[9 : len(authmessage)-1]
-
-			err := json.Unmarshal(modifiedMessage, &ev)
+			var rawMessage []json.RawMessage
+			json.Unmarshal(authmessage, &rawMessage)
+			var ev nostr.Event
+			err := json.Unmarshal(rawMessage[1], &ev)
 			if err != nil {
-				log.Printf("websocketproxy: couldn't parse event: %s\n, %s\n, %s\n", string(authmessage), string(modifiedMessage), err)
+				log.Printf("Error unmarshaling json %v", rawMessage[1])
 				return
 			}
 
@@ -386,24 +397,25 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			}
 		}
 
-		// Accept any attempt by client to AUTH and allow them through
 		if result[0] == "AUTH" {
-			//log.Printf("websocketproxy: received AUTH message: %s", authmessage)
-			modifiedMessage := authmessage[8 : len(authmessage)-1]
-
-			// parse the event
-			//fmt.Println(string(modifiedMessage))
-			json.Unmarshal(modifiedMessage, &ev)
+			var rawMessage []json.RawMessage
+			json.Unmarshal(authmessage, &rawMessage)
+			var ev nostr.Event
+			err := json.Unmarshal(rawMessage[1], &ev)
+			if err != nil {
+				log.Printf("Error unmarshaling json %v", rawMessage[1])
+				return
+			}
 
 			fmt.Println("wss://" + req.Host)
-			gotPubkey, gotOk := nip42.ValidateAuthEvent(&ev, challengeString, "wss://" + req.Host)
+			gotPubkey, gotOk := nip42.ValidateAuthEvent(&ev, challengeString, "wss://"+req.Host)
 
 			successAuth, authResp := quickQuery(req.Host, gotPubkey, *w.ConfigURL)
 
 			if gotOk && successAuth {
 				okString := fmt.Sprintf(`["OK","%v",true,""]`, ev.ID)
 				okResp := []byte(okString)
-				log.Printf("websocketproxy: AUTH success for pubkey %s; %s; %v", gotPubkey, modifiedMessage, ev.Tags)
+				log.Printf("websocketproxy: AUTH success for pubkey %s; %v", gotPubkey, ev.Tags)
 				if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
 					log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
 					return
@@ -420,7 +432,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					return
 				}
 			}
-		} 
+		}
 	}
 
 	errClient := make(chan error, 1)
@@ -448,21 +460,20 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				if len(r) > 0 {
 					if r[0] == "AUTH" {
 						modifiedMessage := msg[8 : len(msg)-1]
-						json.Unmarshal(modifiedMessage, &ev)
 						log.Printf("websocketproxy: Already authenticated, RESENDING OK for %s; %s; %v", ev.PubKey, modifiedMessage, ev.Tags)
 						okString := fmt.Sprintf(`["OK","%v",true,""]`, ev.ID)
 						okResp := []byte(okString)
 						if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
 							log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
 							return
-						}	
+						}
 						continue
-					// this is here to handle the case for private inbox relays where we do not allow REQs for partially authenticated users
+						// this is here to handle the case for private inbox relays where we do not allow REQs for partially authenticated users
 					} else if r[0] == "REQ" {
 						if authStatus == "partial" {
 							log.Printf("partial access detected, dropping req for %s", loggedInAs)
 							// close the REQ with no results
-							closeString := fmt.Sprintf(`["CLOSED","%v","auth-required: you are not authorized to perform reqs"]`, r[1])
+							closeString := fmt.Sprintf(`["CLOSED","%v","partial-access: you are not authorized to perform reqs"]`, r[1])
 							closeReq := []byte(closeString)
 							if err := connPub.WriteMessage(websocket.TextMessage, closeReq); err != nil {
 								log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
@@ -491,7 +502,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 				json.Unmarshal([]byte(msg), &r)
 
-				if len(r) > 2 && r[0] == "EVENT"  {
+				if len(r) > 2 && r[0] == "EVENT" {
 					//var ev event.T
 					evJson, _ := r[2].(map[string]interface{})
 					evKind := evJson["kind"].(float64)
@@ -504,7 +515,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 						continue
 					}
 
-					if evKind == 4 || evKind == 1059 || evKind == 1060 {
+					if evKind == 4 || evKind == 1059 || evKind == 1060 || evKind == 24 || evKind == 25 || evKind == 26 || evKind == 27 || evKind == 35834 {
 						isSensitive = true
 						//log.Printf("FOUND PRIVATE EVENT: kind:%0.f, auth:%s, author:%s", evKind, *w.LoggedInAs, evPubkey)
 						if evPubkey == loggedInAs {
@@ -516,7 +527,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 							tagKey := tag.([]interface{})[0].(string)
 							tagVal := tag.([]interface{})[1].(string)
 							log.Printf("TAG: %s, %s", tagKey, tagVal)
-							if(tagKey == "p" && tagVal == loggedInAs) {
+							if tagKey == "p" && tagVal == loggedInAs {
 								log.Printf("ALLOWING PRIVATE EVENT for ptag %s, kind %.0f", loggedInAs, evKind)
 								isAllow = true
 							}
@@ -529,7 +540,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					}
 				}
 			}
-	
+
 			err = dst.WriteMessage(msgType, msg)
 			if err != nil {
 				errc <- err
@@ -537,7 +548,6 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			}
 		}
 	}
-
 	go replicateWebsocketConn(true, connPub, connBackend, errClient)
 	go replicateWebsocketConn(false, connBackend, connPub, errBackend)
 
