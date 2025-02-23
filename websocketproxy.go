@@ -43,9 +43,9 @@ type WebsocketProxy struct {
 	Director func(incoming *http.Request, out http.Header)
 
 	// Backend returns the backend URL which the proxy uses to reverse proxy
-	// the incoming WebSocket connection. Request is the initial incoming and
-	// unmodified request.
-	Backend func(*http.Request) *url.URL
+	// the incoming WebSocket connection, along with the host response containing mode and other details.
+	// Request is the initial incoming and unmodified request.
+	Backend func(*http.Request) (*url.URL, HostResponse)
 
 	// Upgrader specifies the parameters for upgrading a incoming HTTP
 	// connection to a WebSocket connection. If nil, DefaultUpgrader is used.
@@ -72,14 +72,18 @@ type HostResponse struct {
 	IP     string `json:"ip"`
 	Port   int    `json:"port"`
 	Domain string `json:"domain"`
+	// Mode can be 'authrequired','authmixed', or 'authnone', or 'authnone:requestpayment'
+	Mode    string `json:"mode"`
+	Invoice string `json:"invoice"`
 }
 
 type AuthorizedResponse struct {
 	Authorized bool   `json:"authorized"`
 	Status     string `json:"status"`
+	Invoice    string `json:"invoice"`
 }
 
-func quickHostQuery(hostname string, cURL string) (string, error) {
+func quickHostQuery(hostname string, cURL string) (string, HostResponse, error) {
 	url := cURL + "/authrequired?" + "host=" + hostname
 	rClient := http.Client{
 		Timeout: time.Second * 10,
@@ -89,24 +93,35 @@ func quickHostQuery(hostname string, cURL string) (string, error) {
 
 	if err != nil {
 		log.Println(err.Error())
-		return "", err
+		return "", HostResponse{}, err
 	}
 
 	res, getErr := rClient.Do(req)
 	if getErr != nil {
 		log.Println(getErr.Error())
-		return "", err
+		return "", HostResponse{}, err
 	}
 
 	if res.StatusCode == 200 {
 		defer res.Body.Close()
-		var hostResponse HostResponse
-		decodeErr := json.NewDecoder(res.Body).Decode(&hostResponse)
-
-		if decodeErr != nil {
-			log.Println(decodeErr.Error())
-			return "", decodeErr
+		// Read the raw body
+		bodyBytes, err := io.ReadAll(res.Body)
+		if err != nil {
+			log.Println("Error reading body:", err)
+			return "", HostResponse{}, err
 		}
+
+		// Print the raw response
+		//log.Printf("Raw response body: %s", string(bodyBytes))
+
+		var hostResponse HostResponse
+		decodeErr := json.Unmarshal(bodyBytes, &hostResponse)
+		if decodeErr != nil {
+			log.Printf("JSON decode error: %v for body: %s", decodeErr, string(bodyBytes))
+			return "", HostResponse{}, decodeErr
+		}
+
+		log.Printf("Decoded hostResponse: %+v", hostResponse)
 
 		useIP := "127.0.0.1"
 		if hostResponse.IP != "" {
@@ -114,10 +129,11 @@ func quickHostQuery(hostname string, cURL string) (string, error) {
 		}
 
 		uri := fmt.Sprintf("ws://%s:%d", useIP, hostResponse.Port)
+		log.Println("relay mode is: ", hostResponse.Mode)
 
-		return uri, nil
+		return uri, hostResponse, nil
 	} else {
-		return "", fmt.Errorf("error unmarshaling json")
+		return "", HostResponse{}, fmt.Errorf("error unmarshaling json")
 	}
 }
 
@@ -156,33 +172,29 @@ func quickQuery(hostname string, pubkey string, cURL string) (bool, AuthorizedRe
 	}
 }
 
-// ProxyHandler returns a new http.Handler interface that reverse proxies the
-// request to the given target.
-//func ProxyHandler(target *url.URL) http.Handler { return NewProxy() }
-
 // NewProxy returns a new Websocket reverse proxy that rewrites the
 // URL's to the scheme, host and base path provider in target.
 // mode can be private_relay or protected_dms
 func NewProxy(cURL string) *WebsocketProxy {
 
-	backend := func(r *http.Request) *url.URL {
+	backend := func(r *http.Request) (*url.URL, HostResponse) {
+		response, hostResponse, err := quickHostQuery(r.Host, cURL)
 		// u is in the format ws://IP:PORT
-		response, err := quickHostQuery(r.Host, cURL)
 		if err != nil {
 			log.Printf("websocketproxy: couldn't get backend URL %s", response)
+			return nil, hostResponse
 		}
 
 		u, err := url.Parse(response)
 		if err != nil {
 			log.Printf("websocketproxy: couldn't parse URL %s", response)
+			return nil, hostResponse
 		}
-
-		log.Printf("Proxying: %s -> %s", r.Host, u)
 
 		u.Fragment = r.URL.Fragment
 		u.Path = r.URL.Path
 		u.RawQuery = r.URL.RawQuery
-		return u
+		return u, hostResponse
 	}
 
 	return &WebsocketProxy{Backend: backend, ConfigURL: &cURL}
@@ -196,12 +208,14 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	backendURL := w.Backend(req)
+	backendURL, hostResponse := w.Backend(req)
 	if backendURL == nil {
 		log.Println("websocketproxy: backend URL is nil")
 		http.Error(rw, "internal server error (code: 2)", http.StatusInternalServerError)
 		return
 	}
+
+	log.Printf("Proxying: %s -> %s (mode: %s)", req.Host, backendURL, hostResponse.Mode)
 
 	dialer := w.Dialer
 	if w.Dialer == nil {
@@ -215,7 +229,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		requestHeader.Add("Origin", origin)
 	}
 	for _, prot := range req.Header[http.CanonicalHeaderKey("Sec-WebSocket-Protocol")] {
-		requestHeader.Add("Sec-WebSocket-Protocol", prot)
+		requestHeader.Add("Sec-Websocket-Protocol", prot)
 	}
 	for _, cookie := range req.Header[http.CanonicalHeaderKey("Cookie")] {
 		requestHeader.Add("Cookie", cookie)
@@ -310,126 +324,147 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Send initial message
 	initialAuthString := fmt.Sprintf(`["AUTH","%v"]`, challengeString)
 	authRequest := []byte(initialAuthString)
-	if err := connPub.WriteMessage(websocket.TextMessage, authRequest); err != nil {
-		log.Printf("websocketproxy: couldn't send initial message: %s", err)
-		return
-	}
-
-	// Perform NIP-42 authentication
-	authComplete := false
-	var authmessage []byte
-	var ev nostr.Event
-	authStatus := ""
-	loggedInAs := ""
 
 	authCount := 0
+	authComplete := false
+	var loggedInAs string
+	var authStatus string
+	var authmessage []byte
+	var ev nostr.Event
 
-	for !authComplete {
-		// Wait for the response
-		_, authmessage, err = connPub.ReadMessage()
-		if err != nil {
-			log.Printf("websocketproxy: couldn't read message: %s", err)
+	// If mode is authnone, skip authentication
+	if strings.Contains(hostResponse.Mode, "authnone") {
+		authComplete = true
+		if hostResponse.Mode == "authnone:requestpayment" {
+			// send NOTIFY
+			noticeMessage := fmt.Sprintf(`["NOTIFY","This relay is requesting that you consider donating to the relay using the invoice below or visit https://%s for more info.\n%s\nThank you!\n"]`, req.Host, hostResponse.Invoice)
+			if err := connPub.WriteMessage(websocket.TextMessage, []byte(noticeMessage)); err != nil {
+				log.Printf("websocketproxy: couldn't send notify message: %s", err)
+			}
+		}
+	} else {
+
+		// Send initial AUTH challenge
+		if err := connPub.WriteMessage(websocket.TextMessage, authRequest); err != nil {
+			log.Printf("websocketproxy: couldn't send initial message: %s", err)
 			return
 		}
 
-		// tarpit
-		if authCount > 5 {
-			log.Printf("Client entering tarpit (tries: %d): %s", authCount, realip)
-			time.Sleep(60 * time.Second)
-			// return here or just keep going?
-			//return
-
-			// for now, keep the connection open like a true tarpit, see if we exhaust the connections or not.
-		}
-		authCount += 1
-
-		var result []string
-		json.Unmarshal([]byte(authmessage), &result)
-
-		// avoid panic
-		if len(result) == 0 {
-			continue
-		}
-
-		if result[0] == "REQ" {
-			if err := connPub.WriteMessage(websocket.TextMessage, authRequest); err != nil {
-				log.Printf("websocketproxy: couldn't send initial message: %s", err)
-				return
-			}
-			log.Printf("websocketproxy: received REQ message %s from %s: closing and responding with AUTH", result, realip)
-			closeString := fmt.Sprintf(`["CLOSED","%v","auth-required: you must auth"]`, result[1])
-			closeReq := []byte(closeString)
-			if err := connPub.WriteMessage(websocket.TextMessage, closeReq); err != nil {
-				log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
-				return
-			}
-			// send EOSE, this is not in the spec (anymore?) seems that scrapers will want it tho, so they can go away.
-			eoseString := fmt.Sprintf(`["EOSE","%v"]`, result[1])
-			log.Printf("debug eose %s", eoseString)
-			eoseReq := []byte(eoseString)
-			if err := connPub.WriteMessage(websocket.TextMessage, eoseReq); err != nil {
-				log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
-				return
-			}
-		}
-
-		if result[0] == "EVENT" {
-			var rawMessage []json.RawMessage
-			json.Unmarshal(authmessage, &rawMessage)
-			var ev nostr.Event
-			err := json.Unmarshal(rawMessage[1], &ev)
+		for !authComplete {
+			// Wait for the response
+			_, authmessage, err = connPub.ReadMessage()
 			if err != nil {
-				log.Printf("Error unmarshaling json %v", rawMessage[1])
+				log.Printf("websocketproxy: couldn't read message: %s", err)
 				return
 			}
 
-			// send auth, and OK false in response
-			if err := connPub.WriteMessage(websocket.TextMessage, authRequest); err != nil {
-				log.Printf("websocketproxy: couldn't send initial message: %s", err)
-				return
+			// tarpit
+			if authCount > 5 {
+				log.Printf("Client entering tarpit (tries: %d): IP: %s", authCount, realip)
+				time.Sleep(60 * time.Second)
 			}
-			log.Printf("websocketproxy: received EVENT message %s from %s: responding OK false auth required", result, realip)
-			falseString := fmt.Sprintf(`["OK","%s",false,"auth-required: you must auth"]`, ev.ID)
-			sendFalse := []byte(falseString)
-			if err := connPub.WriteMessage(websocket.TextMessage, sendFalse); err != nil {
-				log.Printf("websocketproxy: couldn't send OK=false message: %s", err)
-				return
-			}
-		}
+			authCount += 1
 
-		if result[0] == "AUTH" {
-			var rawMessage []json.RawMessage
-			json.Unmarshal(authmessage, &rawMessage)
-			var ev nostr.Event
-			err := json.Unmarshal(rawMessage[1], &ev)
-			if err != nil {
-				log.Printf("Error unmarshaling json %v", rawMessage[1])
-				return
+			var result []string
+			json.Unmarshal([]byte(authmessage), &result)
+
+			// avoid panic
+			if len(result) == 0 {
+				continue
 			}
 
-			fmt.Println("wss://" + req.Host)
-			gotPubkey, gotOk := nip42.ValidateAuthEvent(&ev, challengeString, "wss://"+req.Host)
-
-			successAuth, authResp := quickQuery(req.Host, gotPubkey, *w.ConfigURL)
-
-			if gotOk && successAuth {
-				okString := fmt.Sprintf(`["OK","%v",true,""]`, ev.ID)
-				okResp := []byte(okString)
-				log.Printf("websocketproxy: AUTH success for pubkey %s; %v", gotPubkey, ev.Tags)
-				if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
-					log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
+			if result[0] == "REQ" {
+				if err := connPub.WriteMessage(websocket.TextMessage, authRequest); err != nil {
+					log.Printf("websocketproxy: couldn't send initial message: %s", err)
 					return
 				}
-				loggedInAs = gotPubkey
-				authStatus = authResp.Status
-				authComplete = true
-			} else {
-				okString := fmt.Sprintf(`["OK","%v",false,"auth-required: invalid auth received"]`, ev.ID)
-				okResp := []byte(okString)
-				log.Printf("websocketproxy: AUTH failed for pubkey: %s", gotPubkey)
-				if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
-					log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
+				log.Printf("websocketproxy: received REQ message %s from %s: closing and responding with AUTH", result, realip)
+				closeString := fmt.Sprintf(`["CLOSED","%v","auth-required: you must auth"]`, result[1])
+				closeReq := []byte(closeString)
+				if err := connPub.WriteMessage(websocket.TextMessage, closeReq); err != nil {
+					log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
 					return
+				}
+				// send EOSE, this is not in the spec (anymore?) seems that scrapers will want it tho, so they can go away.
+				eoseString := fmt.Sprintf(`["EOSE","%v"]`, result[1])
+				eoseReq := []byte(eoseString)
+				if err := connPub.WriteMessage(websocket.TextMessage, eoseReq); err != nil {
+					log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
+					return
+				}
+			}
+
+			if result[0] == "EVENT" {
+				var rawMessage []json.RawMessage
+				json.Unmarshal(authmessage, &rawMessage)
+				var ev nostr.Event
+				err := json.Unmarshal(rawMessage[1], &ev)
+				if err != nil {
+					log.Printf("Error unmarshaling json %v", rawMessage[1])
+					return
+				}
+
+				// send auth, and OK false in response
+				if err := connPub.WriteMessage(websocket.TextMessage, authRequest); err != nil {
+					log.Printf("websocketproxy: couldn't send initial message: %s", err)
+					return
+				}
+				log.Printf("websocketproxy: received EVENT message %s from %s: responding OK false auth required", result, realip)
+				falseString := fmt.Sprintf(`["OK","%s",false,"auth-required: you must auth"]`, ev.ID)
+				sendFalse := []byte(falseString)
+				if err := connPub.WriteMessage(websocket.TextMessage, sendFalse); err != nil {
+					log.Printf("websocketproxy: couldn't send OK=false message: %s", err)
+					return
+				}
+			}
+
+			if result[0] == "AUTH" {
+				var rawMessage []json.RawMessage
+				json.Unmarshal(authmessage, &rawMessage)
+				var ev nostr.Event
+				err := json.Unmarshal(rawMessage[1], &ev)
+				if err != nil {
+					log.Printf("Error unmarshaling json %v", rawMessage[1])
+					return
+				}
+
+				fmt.Println("wss://" + req.Host)
+				gotPubkey, gotOk := nip42.ValidateAuthEvent(&ev, challengeString, "wss://"+req.Host)
+
+				successAuth, authResp := quickQuery(req.Host, gotPubkey, *w.ConfigURL)
+
+				if gotOk && successAuth {
+					okString := fmt.Sprintf(`["OK","%v",true,""]`, ev.ID)
+					okResp := []byte(okString)
+					log.Printf("websocketproxy: AUTH success for pubkey %s; %v", gotPubkey, ev.Tags)
+					if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
+						log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
+						return
+					}
+					loggedInAs = gotPubkey
+					authStatus = authResp.Status
+					authComplete = true
+
+					fmt.Println("authresponse", authResp)
+
+					if authResp.Invoice != "" {
+						// send NOTIFY
+						fmt.Println("SENDING AN INVOICE")
+						noticeMessage := fmt.Sprintf(`["NOTIFY","This relay is requesting that you consider donating to the relay using the invoice below or visit https://%s for more info.\n%s\nThank you!\n"]`, req.Host, authResp.Invoice)
+						if err := connPub.WriteMessage(websocket.TextMessage, []byte(noticeMessage)); err != nil {
+							log.Printf("websocketproxy: couldn't send notify message: %s", err)
+						}
+					}
+					continue
+
+				} else {
+					okString := fmt.Sprintf(`["OK","%v",false,"auth-required: invalid auth received"]`, ev.ID)
+					okResp := []byte(okString)
+					log.Printf("websocketproxy: AUTH failed for pubkey: %s", gotPubkey)
+					if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
+						log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
+						return
+					}
 				}
 			}
 		}
@@ -516,6 +551,10 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					}
 
 					if evKind == 4 || evKind == 1059 || evKind == 1060 || evKind == 24 || evKind == 25 || evKind == 26 || evKind == 27 || evKind == 35834 {
+						if loggedInAs == "" {
+							log.Printf("DROPPING SENSITIVE EVENT for unauthenticated user")
+							continue
+						}
 						isSensitive = true
 						//log.Printf("FOUND PRIVATE EVENT: kind:%0.f, auth:%s, author:%s", evKind, *w.LoggedInAs, evPubkey)
 						if evPubkey == loggedInAs {
@@ -548,6 +587,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			}
 		}
 	}
+
 	go replicateWebsocketConn(true, connPub, connBackend, errClient)
 	go replicateWebsocketConn(false, connBackend, connPub, errBackend)
 
