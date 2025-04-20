@@ -386,12 +386,12 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					return
 				}
 				// send EOSE, this is not in the spec (anymore?) seems that scrapers will want it tho, so they can go away.
-				eoseString := fmt.Sprintf(`["EOSE","%v"]`, result[1])
-				eoseReq := []byte(eoseString)
-				if err := connPub.WriteMessage(websocket.TextMessage, eoseReq); err != nil {
-					log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
-					return
-				}
+				//eoseString := fmt.Sprintf(`["EOSE","%v"]`, result[1])
+				//eoseReq := []byte(eoseString)
+				//if err := connPub.WriteMessage(websocket.TextMessage, eoseReq); err != nil {
+				//	log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
+				//	return
+				//}
 			}
 
 			if result[0] == "EVENT" {
