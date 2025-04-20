@@ -327,7 +327,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	authCount := 0
 	authComplete := false
-	var loggedInAs string
+	var loggedInAs = make(map[string]string)
 	var authStatus string
 	var authmessage []byte
 	var ev nostr.Event
@@ -441,8 +441,8 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 						log.Printf("websocketproxy: couldn't send AUTH OK message: %s", err)
 						return
 					}
-					loggedInAs = gotPubkey
 					authStatus = authResp.Status
+					loggedInAs[gotPubkey] = authStatus
 					authComplete = true
 
 					fmt.Println("authresponse", authResp)
@@ -496,6 +496,16 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					if r[0] == "AUTH" {
 						modifiedMessage := msg[8 : len(msg)-1]
 						log.Printf("websocketproxy: Already authenticated, RESENDING OK for %s; %s; %v", ev.PubKey, modifiedMessage, ev.Tags)
+
+						gotNewPubkey, gotNewOk := nip42.ValidateAuthEvent(&ev, challengeString, "wss://"+req.Host)
+
+						if gotNewOk {
+							successAuth, authResp := quickQuery(req.Host, gotNewPubkey, *w.ConfigURL)
+							if successAuth {
+								loggedInAs[gotNewPubkey] = authResp.Status
+							}
+						}
+
 						okString := fmt.Sprintf(`["OK","%v",true,""]`, ev.ID)
 						okResp := []byte(okString)
 						if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
@@ -545,19 +555,20 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 					// if authStatus is partial, the user is only allowed to send Events but not read them.
 					// in theory this does not happen because we are blocking all REQs for partially authenticated users already.
-					if authStatus == "partial" {
-						log.Printf("partial access detected, dropping event for %s", loggedInAs)
+					if loggedInAs[evPubkey] == "partial" {
+						log.Printf("partial access detected, dropping event for %v", loggedInAs)
 						continue
 					}
 
 					if evKind == 4 || evKind == 1059 || evKind == 1060 || evKind == 24 || evKind == 25 || evKind == 26 || evKind == 27 || evKind == 35834 {
-						if loggedInAs == "" {
+						/* not necessary only checking that we have authed in some form.
+						if loggedInAs[evPubkey] == "" {
 							log.Printf("DROPPING SENSITIVE EVENT for unauthenticated user")
 							continue
-						}
+						}*/
 						isSensitive = true
 						//log.Printf("FOUND PRIVATE EVENT: kind:%0.f, auth:%s, author:%s", evKind, *w.LoggedInAs, evPubkey)
-						if evPubkey == loggedInAs {
+						if loggedInAs[evPubkey] != "" {
 							log.Printf("ALLOWING PRIVATE EVENT for author %s, kind %.0f", loggedInAs, evKind)
 							isAllow = true
 						}
@@ -566,7 +577,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 							tagKey := tag.([]interface{})[0].(string)
 							tagVal := tag.([]interface{})[1].(string)
 							log.Printf("TAG: %s, %s", tagKey, tagVal)
-							if tagKey == "p" && tagVal == loggedInAs {
+							if tagKey == "p" && loggedInAs[tagVal] != "" {
 								log.Printf("ALLOWING PRIVATE EVENT for ptag %s, kind %.0f", loggedInAs, evKind)
 								isAllow = true
 							}
