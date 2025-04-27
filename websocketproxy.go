@@ -458,7 +458,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 					continue
 
 				} else {
-					okString := fmt.Sprintf(`["OK","%v",false,"auth-required: invalid auth received"]`, ev.ID)
+					okString := fmt.Sprintf(`["OK","%v",false,"restricted: the pubkey does not have access to this relay, or auth event is invalid"]`, ev.ID)
 					okResp := []byte(okString)
 					log.Printf("websocketproxy: AUTH failed for pubkey: %s", gotPubkey)
 					if err := connPub.WriteMessage(websocket.TextMessage, okResp); err != nil {
@@ -518,7 +518,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 						if authStatus == "partial" {
 							log.Printf("partial access detected, dropping req for %s", loggedInAs)
 							// close the REQ with no results
-							closeString := fmt.Sprintf(`["CLOSED","%v","partial-access: you are not authorized to perform reqs"]`, r[1])
+							closeString := fmt.Sprintf(`["CLOSED","%v","restricted: you have partial access to send DMs, you are not authorized to perform reqs"]`, r[1])
 							closeReq := []byte(closeString)
 							if err := connPub.WriteMessage(websocket.TextMessage, closeReq); err != nil {
 								log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
