@@ -359,7 +359,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 			}
 
 			// tarpit
-			if authCount > 5 {
+			if authCount > 40 {
 				log.Printf("Client entering tarpit (tries: %d): IP: %s", authCount, realip)
 				time.Sleep(60 * time.Second)
 			}
@@ -414,6 +414,15 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				sendFalse := []byte(falseString)
 				if err := connPub.WriteMessage(websocket.TextMessage, sendFalse); err != nil {
 					log.Printf("websocketproxy: couldn't send OK=false message: %s", err)
+					return
+				}
+			}
+
+			if result[0] == "NEG-OPEN" {
+				negErr := fmt.Sprintf(`["NEG-ERR","%v","auth-required: you must auth"]`, result[1])
+				closeReq := []byte(negErr)
+				if err := connPub.WriteMessage(websocket.TextMessage, closeReq); err != nil {
+					log.Printf("websocketproxy: couldn't send closeReq message: %s", err)
 					return
 				}
 			}
